@@ -1,0 +1,2219 @@
+#notification_service.py
+import os
+from twilio.rest import Client
+import smtplib
+from email.message import EmailMessage
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =========================
+# TWILIO CONFIG
+# =========================
+
+twilio_client = Client(
+    os.getenv("TWILIO_ACCOUNT_SID"),
+    os.getenv("TWILIO_AUTH_TOKEN")
+)
+
+TWILIO_PHONE = os.getenv("TWILIO_PHONE")
+
+# =========================
+# EMAIL CONFIG
+# =========================
+
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+
+
+def send_sms(to_number: str, message: str):
+    try:
+        twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE,
+            to=to_number
+        )
+        print("SMS sent successfully")
+    except Exception as e:
+        print("SMS failed:", str(e))
+
+
+def send_email(to_email: str, subject: str, body: str):
+    try:
+        msg = EmailMessage()
+        msg["From"] = EMAIL_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_USER, EMAIL_PASS)
+            smtp.send_message(msg)
+
+        print("Email sent successfully")
+
+    except Exception as e:
+        print("Email failed:", str(e))
+
+#otp.py
+import os
+import random
+import logging
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from twilio.rest import Client
+
+from app.db import otp_collection, users_collection
+
+router = APIRouter(prefix="/otp", tags=["OTP"])
+
+# =========================
+# Twilio Setup
+# =========================
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE = os.getenv("TWILIO_PHONE")
+
+twilio_client = None
+
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+else:
+    logging.warning("Twilio environment variables not set properly")
+
+# =========================
+# Request Models
+# =========================
+class SendOTPRequest(BaseModel):
+    mobile_number: str
+
+
+class VerifyOTPRequest(BaseModel):
+    mobile_number: str
+    otp_code: str
+
+
+# =========================
+# OTP Generator
+# =========================
+def generate_otp():
+    return str(random.randint(100000, 999999))
+
+
+# =========================
+# Reusable SMS Function (🔥 Fix for your error)
+# =========================
+def send_sms(mobile_number: str, message: str):
+    if not twilio_client:
+        logging.error("Twilio client not configured")
+        return False
+
+    try:
+        twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE,
+            to=mobile_number
+        )
+        logging.info(f"SMS sent to {mobile_number}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send SMS: {e}")
+        return False
+
+
+# =========================
+# Send OTP Endpoint
+# =========================
+@router.post("/send-otp")
+async def send_otp(data: SendOTPRequest):
+
+    user = users_collection.find_one({"mobile_number": data.mobile_number})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    otp_code = generate_otp()
+
+    # Delete old OTPs
+    otp_collection.delete_many({"mobile_number": data.mobile_number})
+
+    otp_collection.insert_one({
+        "mobile_number": data.mobile_number,
+        "otp_code": otp_code,
+        "expires_at": datetime.utcnow() + timedelta(minutes=5),
+        "created_at": datetime.utcnow()
+    })
+
+    if not send_sms(data.mobile_number, f"Your OTP code is: {otp_code}"):
+        raise HTTPException(status_code=500, detail="Failed to send OTP")
+
+    return {"message": "OTP sent successfully"}
+
+
+# =========================
+# Verify OTP Endpoint
+# =========================
+@router.post("/verify-otp")
+async def verify_otp(data: VerifyOTPRequest):
+
+    otp_record = otp_collection.find_one({
+        "mobile_number": data.mobile_number,
+        "otp_code": data.otp_code
+    })
+
+    if not otp_record:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    if datetime.utcnow() > otp_record["expires_at"]:
+        otp_collection.delete_many({"mobile_number": data.mobile_number})
+        raise HTTPException(status_code=400, detail="OTP expired")
+
+    # Mark user as verified
+    users_collection.update_one(
+        {"mobile_number": data.mobile_number},
+        {"$set": {"mobile_verified": True}}
+    )
+
+    # Delete OTP after success
+    otp_collection.delete_many({"mobile_number": data.mobile_number})
+
+    return {"message": "Mobile verified successfully"}
+
+#reminder.py
+# app/reminder.py
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from app.db import reminders_collection, users_collection
+from datetime import datetime
+import asyncio
+import logging
+from app.otp import send_sms
+from app.email_service import send_email  # async email sender
+
+router = APIRouter()
+
+# =========================
+# Request Model
+# =========================
+class ReminderCreate(BaseModel):
+    user_id: str
+    message: str
+    type: str  # "sms" or "email"
+    send_at: datetime
+
+# =========================
+# API to Create Reminder
+# =========================
+@router.post("/create")
+async def create_reminder(reminder: ReminderCreate):
+    # Validate type
+    if reminder.type not in ["sms", "email"]:
+        raise HTTPException(status_code=400, detail="type must be 'sms' or 'email'")
+
+    # Check if user exists
+    user = users_collection.find_one({"_id": reminder.user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Insert reminder into DB
+    reminder_data = reminder.dict()
+    reminder_data["sent"] = False
+    reminder_data["created_at"] = datetime.utcnow()
+    reminders_collection.insert_one(reminder_data)
+
+    logging.info(f"Reminder scheduled for user {reminder.user_id} at {reminder.send_at}")
+    return {"message": "Reminder scheduled successfully"}
+
+# =========================
+# Background Reminder Scheduler
+# =========================
+async def reminder_scheduler():
+    while True:
+        now = datetime.utcnow()
+        pending = reminders_collection.find({"sent": False, "send_at": {"$lte": now}})
+        for r in pending:
+            user = users_collection.find_one({"_id": r["user_id"]})
+            if not user:
+                logging.warning(f"User {r['user_id']} not found. Skipping reminder {r['_id']}.")
+                continue
+            try:
+                if r["type"] == "sms":
+                    await send_sms(r["user_id"], r["message"])
+                else:
+                    await send_email(user["email"], r["message"])
+                reminders_collection.update_one({"_id": r["_id"]}, {"$set": {"sent": True}})
+                logging.info(f"Reminder {r['_id']} sent to user {r['user_id']}.")
+            except Exception as e:
+                logging.error(f"Error sending reminder {r['_id']} to user {r['user_id']}: {e}")
+        await asyncio.sleep(60)  # check every minute
+
+#risk.py
+from fastapi import APIRouter, Depends, HTTPException
+from app.auth import get_current_user
+from app.db import users_collection, risk_collection
+from datetime import datetime
+
+risk_router = APIRouter()
+
+@risk_router.post("/calculate")
+async def calculate_risk(current_user: str = Depends(get_current_user)):
+    """
+    Calculate user's financial risk score 
+    based on income, expenses, loans, savings, and dependents.
+    """
+
+    # Fetch user financial data
+    user = users_collection.find_one({"email": current_user})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Get financial fields safely
+    monthly_income = user.get("monthly_income", 0)
+    monthly_expenses = user.get("monthly_expenses", 0)
+    total_emi = user.get("total_emi", 0)
+    savings = user.get("savings", 0)
+    dependents = user.get("dependents", 0)
+
+    if monthly_income <= 0:
+        raise HTTPException(status_code=400, detail="Financial data incomplete")
+
+    # Calculate Ratios
+    debt_ratio = total_emi / monthly_income
+    emergency_months = (
+        savings / monthly_expenses if monthly_expenses > 0 else 0
+    )
+
+    # Risk Logic
+    risk_score = 0
+
+    # Debt Risk
+    if debt_ratio > 0.5:
+        risk_score += 40
+    elif debt_ratio > 0.3:
+        risk_score += 25
+
+    # Emergency Fund Risk
+    if emergency_months < 3:
+        risk_score += 30
+    elif emergency_months < 6:
+        risk_score += 15
+
+    # Dependents Risk
+    if dependents > 2:
+        risk_score += 15
+    elif dependents > 0:
+        risk_score += 5
+
+    # Risk Category
+    if risk_score >= 60:
+        category = "High"
+    elif risk_score >= 30:
+        category = "Moderate"
+    else:
+        category = "Low"
+
+    # Prepare risk data document
+    risk_data = {
+        "email": current_user,
+        "risk_score": round(risk_score, 2),
+        "risk_category": category,
+        "debt_ratio": round(debt_ratio, 2),
+        "emergency_months": round(emergency_months, 2),
+        "dependents": dependents,
+        "last_updated": datetime.utcnow()
+    }
+
+    # Save or update in DB (NO await because using pymongo)
+    risk_collection.update_one(
+        {"email": current_user},
+        {"$set": risk_data},
+        upsert=True
+    )
+
+    return risk_data
+
+
+#security.py
+from fastapi import APIRouter, HTTPException, Depends
+from app.db import security_collection
+from app.security_utils import encrypt_data, decrypt_data
+from app.auth import get_current_user
+
+router = APIRouter()
+
+
+# ============================
+# Add Security Questions
+# ============================
+
+@router.post("/add")
+async def add_security(
+    data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    if security_collection.find_one({"user_id": user_id}):
+        raise HTTPException(status_code=400, detail="Security already added")
+
+    security_collection.insert_one({
+        "user_id": user_id,
+        "favorite_color": encrypt_data(data["favorite_color"]),
+        "favorite_place": encrypt_data(data["favorite_place"]),
+        "father_name_answer": encrypt_data(data["father_name_answer"])
+    })
+
+    return {"message": "Security questions saved securely"}
+
+
+# ============================
+# Verify Security Questions
+# ============================
+
+@router.post("/verify")
+async def verify_security(
+    data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    record = security_collection.find_one({"user_id": user_id})
+
+    if not record:
+        raise HTTPException(status_code=400, detail="Security not found")
+
+    if decrypt_data(record["favorite_color"]) != data["favorite_color"]:
+        raise HTTPException(status_code=400, detail="Wrong favorite color")
+
+    if decrypt_data(record["favorite_place"]) != data["favorite_place"]:
+        raise HTTPException(status_code=400, detail="Wrong favorite place")
+
+    if decrypt_data(record["father_name_answer"]) != data["father_name_answer"]:
+        raise HTTPException(status_code=400, detail="Wrong father name")
+
+    return {"message": "Security verified"}
+
+
+#security_utils.py
+from cryptography.fernet import Fernet
+import os
+
+SECRET_ENCRYPTION_KEY = os.getenv("FIELD_ENCRYPTION_KEY")
+
+if not SECRET_ENCRYPTION_KEY:
+    raise ValueError("FIELD_ENCRYPTION_KEY not set in .env file")
+
+cipher = Fernet(SECRET_ENCRYPTION_KEY.encode())
+
+def encrypt_data(data: str):
+    return cipher.encrypt(data.encode()).decode()
+
+def decrypt_data(data: str):
+    return cipher.decrypt(data.encode()).decode()
+
+#utils.py
+from passlib.context import CryptContext
+import random
+from datetime import datetime, timedelta
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def generate_otp():
+    return str(random.randint(100000, 999999))
+
+def otp_expiry():
+    return datetime.utcnow() + timedelta(minutes=5)
+
+#env.pyJWT_SECRET_KEY=your_super_long_random_secret_key_123456789
+MONGO_URI
+TWILIO_ACCOUNT_SID
+TWILIO_AUTH_TOKEN
+TWILIO_PHONE
+EMAIL_USER=your_email@gmail.com
+EMAIL_PASS=your_app_password
+FIELD_ENCRYPTION_KEY
+Kavalani .env lo data ivvala hide chedam ani share cheyakunda
+
+
+#health.py
+from fastapi import APIRouter
+from app.db import health_collection
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/health", tags=["Health"])
+
+class HealthModel(BaseModel):
+    user_id: str
+    blood_group: str
+    allergies: str
+    medical_conditions: str
+
+
+@router.post("/add")
+async def add_health(data: HealthModel):
+    health_collection.insert_one(data.dict())
+    return {"message": "Health record saved"}
+
+
+@router.get("/user/{user_id}")
+async def get_health(user_id: str):
+    data = health_collection.find_one({"user_id": user_id}, {"_id": 0})
+    return {"health_record": data}
+
+#income.py
+from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+from app.models import IncomeData
+from app.db import income_collection
+from app.auth import get_current_user
+
+income_router = APIRouter()
+
+# ==============================
+# Add / Update Income
+# ==============================
+
+@income_router.post("/update")
+async def update_income(
+    data: IncomeData,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    existing = income_collection.find_one({"user_id": user_id})
+
+    income_dict = data.dict()
+    income_dict["user_id"] = user_id
+    income_dict["updated_at"] = datetime.utcnow()
+
+    if existing:
+        income_collection.update_one(
+            {"user_id": user_id},
+            {"$set": income_dict}
+        )
+        return {"message": "Income data updated successfully"}
+    else:
+        income_collection.insert_one(income_dict)
+        return {"message": "Income data added successfully"}
+
+
+# ==============================
+# Get Income
+# ==============================
+
+@income_router.get("/me")
+async def get_income(
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    data = income_collection.find_one(
+        {"user_id": user_id},
+        {"_id": 0}
+    )
+
+    if not data:
+        raise HTTPException(status_code=404, detail="Income data not found")
+
+    return data
+
+
+# ==============================
+# Delete Income
+# ==============================
+
+@income_router.delete("/delete")
+async def delete_income(
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    result = income_collection.delete_one({"user_id": user_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="No income data found")
+
+    return {"message": "Income data deleted successfully"}
+
+
+#insurance.py
+from fastapi import APIRouter, Depends
+from app.auth import get_current_user
+from app.db import insurance_collection
+from pydantic import BaseModel
+from datetime import datetime
+
+router = APIRouter(prefix="/insurance", tags=["Insurance"])
+
+class InsuranceModel(BaseModel):
+    provider: str
+    policy_number: str
+    coverage_amount: float
+
+
+# =========================
+# Add Insurance
+# =========================
+@router.post("/add")
+async def add_insurance(
+    data: InsuranceModel,
+    current_user: str = Depends(get_current_user)
+):
+
+    insurance_collection.insert_one({
+        "email": current_user,
+        "provider": data.provider,
+        "policy_number": data.policy_number,
+        "coverage_amount": data.coverage_amount,
+        "created_at": datetime.utcnow()
+    })
+
+    return {"message": "Insurance added successfully"}
+
+
+# =========================
+# Get Insurance (Logged-in User Only)
+# =========================
+@router.get("/my")
+async def get_my_insurance(
+    current_user: str = Depends(get_current_user)
+):
+
+    data = list(
+        insurance_collection.find(
+            {"email": current_user},
+            {"_id": 0}
+        )
+    )
+
+    return {"insurance": data}
+
+
+#loan.py
+from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+from bson import ObjectId
+
+from app.db import db
+from app.loan_model import Loan
+from app.auth import get_current_user
+
+loan_router = APIRouter()
+loans_collection = db["loans"]
+
+# ============================
+# Add Loan
+# ============================
+
+@loan_router.post("/add")
+async def add_loan(
+    loan: Loan,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]  # ✅ get string id
+
+    loan_dict = loan.dict()
+    loan_dict["user_id"] = user_id   # ✅ store as STRING
+    loan_dict["created_at"] = datetime.utcnow()
+
+    result = loans_collection.insert_one(loan_dict)
+
+    return {
+        "message": "Loan added successfully",
+        "loan_id": str(result.inserted_id)
+    }
+
+
+# ============================
+# Get My Loans
+# ============================
+
+@loan_router.get("/my-loans")
+async def get_loans(
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    loans = list(loans_collection.find({"user_id": user_id}))
+
+    for loan in loans:
+        loan["_id"] = str(loan["_id"])
+
+    return loans
+
+
+# ============================
+# Delete Loan
+# ============================
+
+@loan_router.delete("/delete/{loan_id}")
+async def delete_loan(
+    loan_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    result = loans_collection.delete_one({
+        "_id": ObjectId(loan_id),   # ✅ only here ObjectId is correct
+        "user_id": user_id         # ✅ string match
+    })
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Loan not found")
+
+    return {"message": "Loan deleted successfully"}
+#main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+import asyncio
+from datetime import datetime
+import logging
+
+from app.db import init_db, reminders_collection
+from app.auth import auth_router
+from app.loan import loan_router
+from app.income import income_router
+from app import otp, security, nominee
+from app import documents, banking, insurance, health
+from app import emergency
+from app.dashboard import dashboard_router
+from app.reminder import router as reminder_router
+from app.otp import send_sms
+from app.email_service import send_email  # async email function
+from app.expense import expense_router
+
+# Load env vars
+load_dotenv()
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+
+# =========================
+# Create FastAPI App
+# =========================
+app = FastAPI(
+    title="Responza API",
+    description="AI Emergency Risk Intelligence Backend",
+    version="1.0.0"
+)
+
+# =========================
+# CORS Configuration
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Change for production frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================
+# Reminder Scheduler
+# =========================
+async def reminder_scheduler():
+    while True:
+        try:
+            now = datetime.utcnow()
+            pending = reminders_collection.find({"sent": False, "send_at": {"$lte": now}})
+            for r in pending:
+                try:
+                    if r["type"] == "sms":
+                        await send_sms(r["user_id"], r["message"])
+                    else:
+                        await send_email(r["user_id"], r["message"])
+                    reminders_collection.update_one({"_id": r["_id"]}, {"$set": {"sent": True}})
+                except Exception as e:
+                    logging.error(f"Failed to send reminder {r['_id']}: {e}")
+        except Exception as e:
+            logging.error(f"Reminder Scheduler Error: {e}")
+        await asyncio.sleep(60)  # every minute
+
+# =========================
+# Startup Event
+# =========================
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    asyncio.create_task(reminder_scheduler())
+    logging.info("Backend started and reminder scheduler running...")
+
+# =========================
+# Include Routers
+# =========================
+app.include_router(dashboard_router, prefix="/dashboard", tags=["Dashboard"])
+app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+app.include_router(loan_router, prefix="/loans", tags=["Loans"])
+app.include_router(income_router, prefix="/income", tags=["Income"])
+app.include_router(otp.router, prefix="/otp", tags=["OTP"])
+app.include_router(security.router, prefix="/security", tags=["Security"])
+app.include_router(nominee.router, prefix="/nominee", tags=["Nominee"])
+app.include_router(documents.router)
+app.include_router(banking.router)
+app.include_router(insurance.router)
+app.include_router(health.router)
+app.include_router(emergency.router)
+app.include_router(reminder_router, prefix="/reminders", tags=["Reminders"])
+app.include_router(expense_router, prefix="/expense", tags=["Expense"])
+
+# =========================
+# Static Files
+# =========================
+app.mount("/files", StaticFiles(directory="uploads"), name="files")
+
+# =========================
+# Root & Health Routes
+# =========================
+@app.get("/")
+async def root():
+    return {"message": "Welcome to Responza API", "status": "Backend Running Successfully"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "OK", "service": "Responza Backend"}
+
+#models.py
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
+from datetime import datetime
+from typing import Optional
+
+
+# ==============================
+# User Registration Model
+# ==============================
+
+class User(BaseModel):
+    first_name: str = Field(..., min_length=2, max_length=50)
+    last_name: str = Field(..., min_length=2, max_length=50)
+    dob: str
+    gender: str
+    email: EmailStr
+    mobile_number: str
+    password: str = Field(..., min_length=6)
+
+    class Config:
+        from_attributes = True
+
+
+# ==============================
+# User Login Model
+# ==============================
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+# ==============================
+# User Response Model
+# (Used for returning user data safely)
+# ==============================
+
+class UserResponse(BaseModel):
+    first_name: str
+    last_name: str
+    email: EmailStr
+    mobile_number: str
+    created_at: Optional[datetime]
+
+
+# ==============================
+# Loan Model (Future Use)
+# ==============================
+
+class Loan(BaseModel):
+    loan_type: str
+    emi: float
+    outstanding_amount: float
+    interest_rate: float
+    remaining_tenure: int
+    due_date: Optional[datetime]
+
+
+# ==============================
+# Finance Model (For AI Risk Engine)
+# ==============================
+
+class Finance(BaseModel):
+    monthly_income: float
+    other_income: Optional[float] = 0
+    monthly_expenses: float
+    current_savings: float
+    emergency_fund: Optional[float] = 0
+    dependents: Optional[int] = 0
+
+class IncomeData(BaseModel):
+    monthly_income: float
+    other_income: Optional[float] = 0
+    monthly_expenses: float
+    current_savings: float
+    emergency_fund: float
+    dependents: int
+
+#models.py
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
+from datetime import datetime
+from typing import Optional
+
+
+# ==============================
+# User Registration Model
+# ==============================
+
+class User(BaseModel):
+    first_name: str = Field(..., min_length=2, max_length=50)
+    last_name: str = Field(..., min_length=2, max_length=50)
+    dob: str
+    gender: str
+    email: EmailStr
+    mobile_number: str
+    password: str = Field(..., min_length=6)
+
+    class Config:
+        from_attributes = True
+
+
+# ==============================
+# User Login Model
+# ==============================
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+# ==============================
+# User Response Model
+# (Used for returning user data safely)
+# ==============================
+
+class UserResponse(BaseModel):
+    first_name: str
+    last_name: str
+    email: EmailStr
+    mobile_number: str
+    created_at: Optional[datetime]
+
+
+# ==============================
+# Loan Model (Future Use)
+# ==============================
+
+class Loan(BaseModel):
+    loan_type: str
+    emi: float
+    outstanding_amount: float
+    interest_rate: float
+    remaining_tenure: int
+    due_date: Optional[datetime]
+
+
+# ==============================
+# Finance Model (For AI Risk Engine)
+# ==============================
+
+class Finance(BaseModel):
+    monthly_income: float
+    other_income: Optional[float] = 0
+    monthly_expenses: float
+    current_savings: float
+    emergency_fund: Optional[float] = 0
+    dependents: Optional[int] = 0
+
+class IncomeData(BaseModel):
+    monthly_income: float
+    other_income: Optional[float] = 0
+    monthly_expenses: float
+    current_savings: float
+    emergency_fund: float
+    dependents: int
+
+#nominee.py
+from fastapi import APIRouter, HTTPException
+from app.db import users_collection
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+import jwt
+import os
+
+router = APIRouter()
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_MINUTES = 60  # 1 hour expiry
+
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY not set in environment variables")
+
+# =========================
+# Request Model
+# =========================
+class NomineeLoginModel(BaseModel):
+    mobile_number: str
+    dob: str
+    father_name: str
+
+# =========================
+# Nominee Login
+# =========================
+@router.post("/login")
+async def nominee_login(data: NomineeLoginModel):
+
+    user = users_collection.find_one({
+        "mobile_number": data.mobile_number,
+        "dob": data.dob,
+        "father_name": data.father_name
+    })
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid details")
+
+    # Create token with expiry
+    payload = {
+        "sub": user["email"],
+        "role": "nominee",
+        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
+    }
+
+    token = jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
+
+    return {
+        "message": "Nominee login successful",
+        "access_token": token,
+        "token_type": "bearer"
+    }
+
+
+#admin.py
+from fastapi import APIRouter, Depends, HTTPException
+from app.auth import get_current_user
+from app.db import users_collection
+from bson import ObjectId
+from typing import List
+
+admin_router = APIRouter(prefix="/admin", tags=["Admin"])
+
+
+# ✅ Helper Function to Convert Mongo Document
+def serialize_user(user):
+    return {
+        "id": str(user["_id"]),
+        "name": user.get("name"),
+        "email": user.get("email"),
+        "role": user.get("role", "user"),
+        "is_admin": user.get("is_admin", False)
+    }
+
+
+# ✅ Get All Users (Admin Only)
+@admin_router.get("/users")
+async def get_all_users(current_user: str = Depends(get_current_user)):
+
+    admin = users_collection.find_one({"email": current_user})
+
+    if not admin or not admin.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    users = list(users_collection.find({}))
+
+    return {
+        "total_users": len(users),
+        "users": [serialize_user(user) for user in users]
+    }
+
+
+# ✅ Update User Role (Admin Only)
+@admin_router.put("/users/{user_id}/role")
+async def update_user_role(
+    user_id: str,
+    role: str,
+    current_user: str = Depends(get_current_user)
+):
+
+    admin = users_collection.find_one({"email": current_user})
+
+    if not admin or not admin.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        object_id = ObjectId(user_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    result = users_collection.update_one(
+        {"_id": object_id},
+        {"$set": {"role": role}}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "Role updated successfully"}
+
+
+#auth.py
+import os
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+from passlib.context import CryptContext
+from dotenv import load_dotenv
+from pydantic import BaseModel, EmailStr
+
+from app.db import users_collection, security_collection
+
+# ==============================
+# LOAD ENV VARIABLES
+# ==============================
+load_dotenv()
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "supersecretkey")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# ==============================
+# PASSWORD HASHING
+# ==============================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str):
+    return pwd_context.verify(plain_password, hashed_password)
+
+# ==============================
+# JWT TOKEN FUNCTIONS
+# ==============================
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+
+    expire = datetime.utcnow() + (
+        expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+
+# ==============================
+# REQUEST MODELS
+# ==============================
+
+class RegisterUser(BaseModel):
+    first_name: str
+    last_name: str
+    dob: str
+    gender: str
+    address: str
+    email: EmailStr
+    mobile_number: str
+    username: str
+    password: str
+    preferred_language: str
+
+
+class LoginUser(BaseModel):
+    email: EmailStr
+    password: str
+
+
+# ==============================
+# AUTH ROUTER
+# ==============================
+auth_router = APIRouter()
+security = HTTPBearer()
+
+# ==============================
+# REGISTER USER
+# ==============================
+@auth_router.post("/register")
+async def register(user: RegisterUser):
+
+    if users_collection.find_one({"email": user.email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    if users_collection.find_one({"username": user.username}):
+        raise HTTPException(status_code=400, detail="Username already taken")
+
+    if users_collection.find_one({"mobile_number": user.mobile_number}):
+        raise HTTPException(status_code=400, detail="Mobile number already registered")
+
+    hashed_password = hash_password(user.password)
+
+    user_data = {
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "dob": user.dob,
+        "gender": user.gender,
+        "address": user.address,
+        "email": user.email,
+        "mobile_number": user.mobile_number,
+        "username": user.username,
+        "password": hashed_password,
+        "preferred_language": user.preferred_language,
+        "role": "user",
+        "mobile_verified": False,
+        "created_at": datetime.utcnow()
+    }
+
+    result = users_collection.insert_one(user_data)
+
+    return {
+        "message": "User registered successfully",
+        "user_id": str(result.inserted_id)
+    }
+
+
+# ==============================
+# LOGIN USER
+# ==============================
+@auth_router.post("/login")
+async def login(user: LoginUser):
+
+    db_user = users_collection.find_one({"email": user.email})
+
+    if not db_user or not verify_password(user.password, db_user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    access_token = create_access_token(
+        data={
+            "sub": user.email,
+            "role": db_user["role"]
+        }
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+
+# ==============================
+# ADMIN CHECK DEPENDENCY
+# ==============================
+def admin_required(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+    payload = verify_token(token)
+
+    if payload.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
+
+    return payload
+
+
+@auth_router.get("/admin-only")
+async def admin_route(user=Depends(admin_required)):
+    return {"message": "Welcome Admin 🔥"}
+
+
+# ==============================
+# GET CURRENT USER (IMPORTANT FIX)
+# ==============================
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+    payload = verify_token(token)
+
+    db_user = users_collection.find_one({"email": payload["sub"]})
+
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 🔥 RETURN FULL USER INCLUDING _id
+    db_user["_id"] = str(db_user["_id"])
+    return db_user
+
+
+# ==============================
+# GET PROFILE
+# ==============================
+@auth_router.get("/me")
+async def get_profile(current_user: dict = Depends(get_current_user)):
+
+    return {
+        "user_id": current_user["_id"],
+        "email": current_user["email"],
+        "username": current_user["username"],
+        "first_name": current_user["first_name"],
+        "last_name": current_user["last_name"],
+        "mobile_number": current_user["mobile_number"],
+        "preferred_language": current_user["preferred_language"]
+    }
+
+
+# ==============================
+# FORGOT PASSWORD
+# ==============================
+@auth_router.post("/forgot-password")
+async def forgot_password(
+    email: str,
+    favorite_color: str,
+    favorite_place: str,
+    father_name: str
+):
+
+    user = users_collection.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    security_data = security_collection.find_one({
+        "user_id": str(user["_id"]),
+        "favorite_color": favorite_color,
+        "favorite_place": favorite_place,
+        "father_name_answer": father_name
+    })
+
+    if not security_data:
+        raise HTTPException(status_code=400, detail="Security answers incorrect")
+
+    return {"message": "Security verified. You can reset password now."}
+
+
+# ==============================
+# RESET PASSWORD
+# ==============================
+@auth_router.post("/reset-password")
+async def reset_password(email: str, new_password: str):
+
+    hashed = hash_password(new_password)
+
+    users_collection.update_one(
+        {"email": email},
+        {"$set": {"password": hashed}}
+    )
+
+    return {"message": "Password updated successfully"}
+
+#banking.py
+from fastapi import APIRouter, Depends, HTTPException
+from app.db import bank_collection
+from pydantic import BaseModel
+from app.security_utils import encrypt_data, decrypt_data
+from app.dependencies import require_role
+
+router = APIRouter(prefix="/bank", tags=["Banking"])
+
+class BankModel(BaseModel):
+    user_id: str
+    bank_name: str
+    account_number: str
+    ifsc_code: str
+
+
+# 🔐 ADD BANK DETAILS (Encrypted)
+@router.post("/add", dependencies=[Depends(require_role("user"))])
+async def add_bank(data: BankModel):
+
+    encrypted_account = encrypt_data(data.account_number)
+    encrypted_ifsc = encrypt_data(data.ifsc_code)
+
+    bank_collection.insert_one({
+        "user_id": data.user_id,
+        "bank_name": data.bank_name,
+        "account_number": encrypted_account,
+        "ifsc_code": encrypted_ifsc
+    })
+
+    return {"message": "Bank details encrypted & saved securely"}
+
+
+# 🔓 GET BANK DETAILS (Decrypt while fetching)
+@router.get("/user/{user_id}", dependencies=[Depends(require_role("user"))])
+async def get_bank(user_id: str):
+
+    records = list(bank_collection.find({"user_id": user_id}))
+
+    if not records:
+        raise HTTPException(status_code=404, detail="No bank details found")
+
+    result = []
+
+    for record in records:
+        result.append({
+            "user_id": record["user_id"],
+            "bank_name": record["bank_name"],
+            "account_number": decrypt_data(record["account_number"]),
+            "ifsc_code": decrypt_data(record["ifsc_code"])
+        })
+
+    return {"bank_details": result}
+
+#cleanup.py
+# app/cleanup.py
+import os
+import logging
+from datetime import datetime, timedelta
+from app.db import (
+    users_collection,
+    loan_collection,
+    reminders_collection,
+    risk_collection,
+)
+from dotenv import load_dotenv
+
+# =========================
+# Setup Logging
+# =========================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("Cleanup")
+
+# =========================
+# Load Environment Variables
+# =========================
+load_dotenv()
+
+required_env_keys = [
+    "JWT_SECRET_KEY",
+    "MONGO_URI",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_PHONE",
+    "EMAIL_USER",
+    "EMAIL_PASS",
+    "FIELD_ENCRYPTION_KEY",
+]
+
+logger.info("Checking environment variables...")
+missing_keys = [k for k in required_env_keys if not os.getenv(k)]
+if missing_keys:
+    logger.warning(f"Missing environment variables: {missing_keys}")
+else:
+    logger.info("All required environment variables are present.")
+
+# =========================
+# Clean Test / Debug Data
+# =========================
+logger.info("Cleaning test and debug data...")
+
+# Remove test OTP users
+result = users_collection.update_many(
+    {"mobile_verified": False, "email": {"$regex": "test"}},
+    {"$set": {"mobile_verified": True}}
+)
+logger.info(f"Marked {result.modified_count} test users as verified")
+
+# Remove test reminders
+deleted_reminders = reminders_collection.delete_many({"message": {"$regex": "test"}})
+logger.info(f"Deleted {deleted_reminders.deleted_count} test reminders")
+
+# Remove test loans
+deleted_loans = loan_collection.delete_many({"amount": {"$lte": 0}})
+logger.info(f"Deleted {deleted_loans.deleted_count} test loans")
+
+# Remove test risk entries
+deleted_risk = risk_collection.delete_many({"risk_score": {"$lte": 0}})
+logger.info(f"Deleted {deleted_risk.deleted_count} test risk entries")
+
+# =========================
+# Auto-remove old reminders (>30 days)
+# =========================
+cutoff_date = datetime.utcnow() - timedelta(days=30)
+old_reminders = reminders_collection.delete_many({"send_at": {"$lt": cutoff_date}})
+logger.info(f"Deleted {old_reminders.deleted_count} reminders older than 30 days")
+
+# =========================
+# Validate Collections
+# =========================
+logger.info("Validating critical collections...")
+
+collections_to_check = {
+    "users": users_collection,
+    "loans": loan_collection,
+    "reminders": reminders_collection,
+    "risk": risk_collection,
+}
+
+for name, coll in collections_to_check.items():
+    count = coll.count_documents({})
+    if count == 0:
+        logger.warning(f"Collection '{name}' is empty!")
+    else:
+        logger.info(f"Collection '{name}' has {count} documents")
+
+# =========================
+# Final Message
+# =========================
+logger.info("Cleanup & validation complete. Backend is ready for production!")
+
+#crud.py
+def create_user(user: User):
+    hashed_password = hash_password(user.password)
+    user_dict = user.dict()
+    user_dict["password_hash"] = hashed_password
+    del user_dict["password"]   # remove plain password
+
+    result = users_collection.insert_one(user_dict)
+    return {"message": "User created successfully", "id": str(result.inserted_id)}
+
+#dashboard.py
+from fastapi import APIRouter, Depends, HTTPException
+from app.auth import get_current_user
+from app.db import (
+    users_collection,
+    loan_collection,
+    income_collection,
+    insurance_collection,
+    risk_collection,
+    documents_collection,
+    emergency_collection,
+    expense_collection,
+    lending_collection
+)
+from datetime import datetime
+
+dashboard_router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+@dashboard_router.get("/summary")
+async def get_dashboard_summary(current_user: str = Depends(get_current_user)):
+
+    # -------------------------
+    # GET USER
+    # -------------------------
+    user = users_collection.find_one({"email": current_user})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_id = str(user["_id"])
+
+    # -------------------------
+    # BASIC COUNTS (STANDARDIZED USING user_id)
+    # -------------------------
+
+    total_loans = loan_collection.count_documents({"user_id": user_id})
+
+    active_loans = loan_collection.count_documents({
+        "user_id": user_id,
+        "status": "active"
+    })
+
+    total_income_records = income_collection.count_documents({"user_id": user_id})
+    total_insurance = insurance_collection.count_documents({"user_id": user_id})
+    total_documents = documents_collection.count_documents({"user_id": user_id})
+    total_emergencies = emergency_collection.count_documents({"user_id": user_id})
+
+    # -------------------------
+    # LATEST RISK SCORE
+    # -------------------------
+
+    latest_risk = risk_collection.find_one(
+        {"email": current_user},
+        sort=[("last_updated", -1)]
+    )
+
+    risk_score = latest_risk["risk_score"] if latest_risk else 0
+
+    # -------------------------
+    # EXPENSE TREND
+    # -------------------------
+
+    current_month = datetime.utcnow().month
+    current_year = datetime.utcnow().year
+
+    current_expense = expense_collection.find_one({
+        "email": current_user,
+        "month": current_month,
+        "year": current_year
+    })
+
+    # Previous month calculation
+    if current_month == 1:
+        prev_month = 12
+        prev_year = current_year - 1
+    else:
+        prev_month = current_month - 1
+        prev_year = current_year
+
+    previous_expense = expense_collection.find_one({
+        "email": current_user,
+        "month": prev_month,
+        "year": prev_year
+    })
+
+    trend = "No Data"
+
+    if current_expense and previous_expense:
+        current_total = current_expense.get("total_expense", 0)
+        previous_total = previous_expense.get("total_expense", 0)
+
+        if current_total > previous_total:
+            trend = "Increased 📈"
+        elif current_total < previous_total:
+            trend = "Decreased 📉"
+        else:
+            trend = "No Change"
+
+    # -------------------------
+    # SURVIVAL MONTHS
+    # -------------------------
+
+    latest_income = income_collection.find_one(
+        {"user_id": user_id},
+        sort=[("created_at", -1)]
+    )
+
+    survival_months = 0
+    emergency_zone = "No Data"
+
+    if latest_income and current_expense:
+
+        savings = latest_income.get("savings", 0)
+        total_expense = current_expense.get("total_expense", 0)
+
+        if total_expense > 0:
+            survival_months = round(savings / total_expense, 1)
+
+        if survival_months < 3:
+            emergency_zone = "🔴 Danger"
+        elif 3 <= survival_months <= 6:
+            emergency_zone = "🟡 Moderate"
+        else:
+            emergency_zone = "🟢 Stable"
+
+    # -------------------------
+    # FINANCIAL HEALTH SCORE
+    # -------------------------
+
+    financial_health_score = 100
+
+    if survival_months < 3:
+        financial_health_score -= 40
+    elif 3 <= survival_months <= 6:
+        financial_health_score -= 20
+
+    if trend == "Increased 📈":
+        financial_health_score -= 15
+
+    if active_loans > 2:
+        financial_health_score -= 20
+
+    financial_health_score = max(financial_health_score, 0)
+
+    if financial_health_score >= 75:
+        health_status = "🟢 Excellent"
+    elif 50 <= financial_health_score < 75:
+        health_status = "🟡 Good"
+    elif 30 <= financial_health_score < 50:
+        health_status = "🟠 Risky"
+    else:
+        health_status = "🔴 Critical"
+
+    # -------------------------
+    # UNTRACKED MONEY LOGIC
+    # -------------------------
+
+    income_total = sum(
+        i.get("amount", 0)
+        for i in income_collection.find({"user_id": user_id})
+    )
+
+    expense_total = sum(
+        e.get("total_expense", 0)
+        for e in expense_collection.find({"email": current_user})
+    )
+
+    given_total = sum(
+        l.get("amount", 0)
+        for l in lending_collection.find(
+            {"email": current_user, "type": "given", "status": "pending"}
+        )
+    )
+
+    taken_total = sum(
+        l.get("amount", 0)
+        for l in lending_collection.find(
+            {"email": current_user, "type": "taken", "status": "pending"}
+        )
+    )
+
+    expected_balance = income_total - expense_total - given_total + taken_total
+
+    actual_savings = user.get("savings", 0)
+
+    untracked_amount = round(expected_balance - actual_savings, 2)
+
+    # -------------------------
+    # FINAL RESPONSE
+    # -------------------------
+
+    return {
+        "status": "success",
+        "data": {
+            "total_loans": total_loans,
+            "active_loans": active_loans,
+            "income_records": total_income_records,
+            "insurance_count": total_insurance,
+            "documents_count": total_documents,
+            "total_emergencies": total_emergencies,
+            "latest_risk_score": risk_score,
+            "expense_trend": trend,
+            "survival_months": survival_months,
+            "emergency_zone": emergency_zone,
+            "financial_health_score": financial_health_score,
+            "health_status": health_status,
+            "untracked_amount": untracked_amount,
+            "generated_at": datetime.utcnow()
+        }
+    }
+
+
+#db.py
+from pymongo import MongoClient
+import os
+from dotenv import load_dotenv
+
+# ==========================
+# Load Environment Variables
+# ==========================
+load_dotenv()
+
+MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://appresponza_db_user:9346724367@responza.frfxhhp.mongodb.net/?appName=Responza"
+)
+
+
+if not MONGO_URI:
+    raise Exception("❌ MONGO_URI not found in .env file")
+
+# ==========================
+# MongoDB Client
+# ==========================
+client = MongoClient(MONGO_URI)
+
+# ==========================
+# Database
+# ==========================
+db = client["responza_db"]
+
+# ==========================
+# Collections
+# ==========================
+users_collection = db["users"]
+loan_collection = db["loans"]
+risk_collection = db["risk_profiles"]
+income_collection = db["income"]
+documents_collection = db["documents"]
+bank_collection = db["bank_details"]
+insurance_collection = db["insurance"]
+health_collection = db["health_records"]
+emergency_collection = db["emergency"]
+audit_collection = db["audit_logs"]
+reminders_collection = db["reminders"]
+expense_collection = db["expenses"]
+lending_collection = db["lending"]
+monthly_confirmation_collection = db["monthly_confirmation"]
+
+
+# Phase 1 collections
+security_collection = db["security_questions"]
+otp_collection = db["otp_verifications"]
+nominee_collection = db["nominees"]
+
+# ==========================
+# Init DB Connection
+# ==========================
+def init_db():
+    try:
+        client.admin.command("ping")
+        print("✅ MongoDB connected successfully")
+    except Exception as e:
+        print("❌ MongoDB connection error:", e)
+
+
+
+#dependencies.py
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer
+import jwt
+import os
+
+security = HTTPBearer()
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+def get_current_user(token=Depends(security)):
+    try:
+        payload = jwt.decode(token.credentials, SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except:
+        raise HTTPException(status_code=401, detail="Invalid Token")
+
+def require_role(required_role: str):
+    def role_checker(user=Depends(get_current_user)):
+        if user["role"] != required_role:
+            raise HTTPException(status_code=403, detail="Access denied")
+        return user
+    return role_checker
+
+#documents.py
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from app.db import documents_collection
+from app.dependencies import require_role, get_current_user
+from datetime import datetime
+import shutil
+import os
+
+router = APIRouter(prefix="/documents", tags=["Documents"])
+
+UPLOAD_DIR = "uploads"
+
+
+# =========================
+# Upload Document
+# =========================
+
+@router.post("/upload", dependencies=[Depends(require_role("user"))])
+async def upload_document(
+    doc_type: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = str(current_user["_id"])
+
+    if not os.path.exists(UPLOAD_DIR):
+        os.makedirs(UPLOAD_DIR)
+
+    # Safe filename
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe_filename = f"{user_id}_{timestamp}_{file.filename}"
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    documents_collection.insert_one({
+        "user_id": user_id,
+        "doc_type": doc_type,
+        "file_path": file_path,
+        "uploaded_at": datetime.utcnow()
+    })
+
+    return {"message": "Document uploaded successfully"}
+
+
+# =========================
+# Get My Documents
+# =========================
+
+@router.get("/my", dependencies=[Depends(require_role("user"))])
+async def get_my_documents(
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = str(current_user["_id"])
+
+    docs = list(
+        documents_collection.find(
+            {"user_id": user_id},
+            {"_id": 0}
+        )
+    )
+
+    if not docs:
+        raise HTTPException(status_code=404, detail="No documents found")
+
+    result = []
+
+    for doc in docs:
+        result.append({
+            "doc_type": doc["doc_type"],
+            "file_url": f"/files/{os.path.basename(doc['file_path'])}",
+            "uploaded_at": doc.get("uploaded_at")
+        })
+
+    return {"documents": result}#email_service.py
+import os
+import aiosmtplib
+from email.message import EmailMessage
+from app.db import users_collection
+
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+
+async def send_email(user_id: str, message: str):
+    user = users_collection.find_one({"_id": user_id})
+    if not user or not user.get("email"):
+        return
+
+    msg = EmailMessage()
+    msg["From"] = EMAIL_USER
+    msg["To"] = user["email"]
+    msg["Subject"] = "Responza Notification"
+    msg.set_content(message)
+
+    await aiosmtplib.send(
+        msg,
+        hostname="smtp.gmail.com",
+        port=587,
+        start_tls=True,
+        username=EMAIL_USER,
+        password=EMAIL_PASS,
+    )
+
+#emergency.py
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from pydantic import BaseModel
+from enum import Enum
+from datetime import datetime
+from bson import ObjectId, errors as bson_errors
+
+from app.notification_service import send_sms, send_email
+from app.db import emergency_collection
+from app.dependencies import require_role, get_current_user
+
+router = APIRouter(prefix="/emergency", tags=["Emergency"])
+
+
+# =========================
+# Emergency Types
+# =========================
+
+class EmergencyType(str, Enum):
+    medical = "Medical"
+    accident = "Accident"
+    financial = "Financial"
+    threat = "Threat"
+
+
+# =========================
+# Request Model
+# =========================
+
+class EmergencyRequest(BaseModel):
+    location: str
+    emergency_type: EmergencyType
+
+
+# =========================
+# Trigger Emergency
+# =========================
+
+@router.post("/trigger", dependencies=[Depends(require_role("user"))])
+async def trigger_emergency(
+    data: EmergencyRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = str(current_user["_id"])
+
+    # Save emergency
+    emergency_id = emergency_collection.insert_one({
+        "user_id": user_id,
+        "location": data.location,
+        "type": data.emergency_type.value,
+        "status": "ACTIVE",
+        "created_at": datetime.utcnow()
+    }).inserted_id
+
+    message = (
+        f"🚨 {data.emergency_type.value.upper()} EMERGENCY 🚨\n\n"
+        f"User: {current_user.get('name')}\n"
+        f"Location: {data.location}\n\n"
+        "Immediate assistance required."
+    )
+
+    nominee_phone = current_user.get("nominee_phone")
+    nominee_email = current_user.get("nominee_email")
+
+    if nominee_phone:
+        background_tasks.add_task(send_sms, nominee_phone, message)
+
+    if nominee_email:
+        background_tasks.add_task(
+            send_email,
+            nominee_email,
+            f"{data.emergency_type.value} Emergency Alert 🚨",
+            message
+        )
+
+    return {
+        "message": f"{data.emergency_type.value} emergency triggered successfully",
+        "emergency_id": str(emergency_id),
+        "status": "ACTIVE"
+    }
+
+
+# =========================
+# Get Emergency History
+# =========================
+
+@router.get("/history", dependencies=[Depends(require_role("user"))])
+async def get_emergency_history(
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = str(current_user["_id"])
+
+    emergencies = list(
+        emergency_collection.find(
+            {"user_id": user_id},
+            {"_id": 0}
+        )
+    )
+
+    return {
+        "total_records": len(emergencies),
+        "emergencies": emergencies
+    }
+
+
+# =========================
+# Close Emergency
+# =========================
+
+@router.put("/close/{emergency_id}", dependencies=[Depends(require_role("user"))])
+async def close_emergency(
+    emergency_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = str(current_user["_id"])
+
+    # Safe ObjectId conversion
+    try:
+        obj_id = ObjectId(emergency_id)
+    except bson_errors.InvalidId:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid emergency ID"
+        )
+
+    result = emergency_collection.update_one(
+        {
+            "_id": obj_id,
+            "user_id": user_id
+        },
+        {
+            "$set": {
+                "status": "CLOSED",
+                "closed_at": datetime.utcnow()
+            }
+        }
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Emergency not found or already closed"
+        )
+
+    return {
+        "message": "Emergency closed successfully",
+        "status": "CLOSED"
+    }
+
+#expense.py
+from fastapi import APIRouter, Depends
+from app.auth import get_current_user
+from app.db import expense_collection
+from datetime import datetime
+
+expense_router = APIRouter()
+
+@expense_router.post("/add")
+async def add_expense(
+    data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    month = data.get("month")
+    year = data.get("year")
+    categories = data.get("categories", {})
+
+    if not month or not year:
+        return {"status": "error", "message": "Month and Year required"}
+
+    if not isinstance(categories, dict):
+        return {"status": "error", "message": "Categories must be dictionary"}
+
+    total_expense = sum(categories.values())
+
+    expense_data = {
+        "user_id": user_id,   # ✅ changed from email
+        "month": month,
+        "year": year,
+        "categories": categories,
+        "total_expense": total_expense,
+        "created_at": datetime.utcnow()
+    }
+
+    # Upsert → if month exists update, else create
+    expense_collection.update_one(
+        {
+            "user_id": user_id,  # ✅ changed
+            "month": month,
+            "year": year
+        },
+        {"$set": expense_data},
+        upsert=True
+    )
+
+    return {
+        "status": "success",
+        "message": "Expense saved successfully",
+        "total_expense": total_expense
+    }
+
+#lending.py
+from fastapi import APIRouter, Depends
+from app.auth import get_current_user
+from app.db import lending_collection
+from datetime import datetime
+from pydantic import BaseModel
+
+lending_router = APIRouter()
+
+class LendingModel(BaseModel):
+    type: str  # "given" or "taken"
+    amount: float
+    person: str
+    expected_return_date: str
+
+
+# ============================
+# Add Lending
+# ============================
+
+@lending_router.post("/add")
+async def add_lending(
+    data: LendingModel,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    lending_collection.insert_one({
+        "user_id": user_id,   # ✅ changed
+        "type": data.type,
+        "amount": data.amount,
+        "person": data.person,
+        "expected_return_date": data.expected_return_date,
+        "status": "pending",
+        "created_at": datetime.utcnow()
+    })
+
+    return {"message": "Lending record added successfully"}
+
+
+# ============================
+# Get All Lending
+# ============================
+
+@lending_router.get("/all")
+async def get_lending(
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    records = list(
+        lending_collection.find(
+            {"user_id": user_id},   # ✅ changed
+            {"_id": 0}
+        )
+    )
+
+    return records
+
+
+# ============================
+# Mark Returned
+# ============================
+
+@lending_router.put("/mark-returned/{person}")
+async def mark_returned(
+    person: str,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    lending_collection.update_one(
+        {"user_id": user_id, "person": person},  # ✅ changed
+        {"$set": {"status": "returned"}}
+    )
+
+    return {"message": "Marked as returned"}
+#confirmation.py
+from fastapi import APIRouter, Depends
+from app.auth import get_current_user
+from app.db import monthly_confirmation_collection
+from datetime import datetime
+
+confirmation_router = APIRouter()
+
+@confirmation_router.post("/confirm")
+async def confirm_month(
+    month: int,
+    year: int,
+    current_user: dict = Depends(get_current_user)
+):
+
+    user_id = current_user["_id"]
+
+    monthly_confirmation_collection.update_one(
+        {
+            "user_id": user_id,   # ✅ changed from email
+            "month": month,
+            "year": year
+        },
+        {
+            "$set": {
+                "financial_data_confirmed": True,
+                "confirmed_at": datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+
+    return {"message": "Financial data confirmed"}
