@@ -1,23 +1,46 @@
-const envApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
+const API_BASE = "https://responza-api.onrender.com";
 
-// Render backend default
-const defaultApiBase = "https://responza-api.onrender.com";
-
-// Final API base URL
-export const API_BASE = (envApiBase || defaultApiBase).replace(/\/+$/, "");
-
-// Common API request helper
-export async function apiRequest(endpoint: string, options: RequestInit = {}) {
-  const response = await fetch(`${API_BASE}${endpoint}`, {
+export const sendOTP = async (mobile_number: string) => {
+  const response = await fetch(`${API_BASE}/send-otp`, {
+    method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    ...options,
+    body: JSON.stringify({
+      mobile_number,
+      purpose: "registration",
+    }),
   });
 
-  if (!response.ok) {
-    throw new Error("API request failed");
-  }
+  return response.json();
+};
+
+export const verifyOTP = async (mobile_number: string, otp_code: string) => {
+  const response = await fetch(`${API_BASE}/verify-otp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      mobile_number,
+      otp_code,
+    }),
+  });
 
   return response.json();
-}
+};
+
+export const loginUser = async (email: string, password: string) => {
+  const response = await fetch(`${API_BASE}/login`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      email,
+      password,
+    }),
+  });
+
+  return response.json();
+};
