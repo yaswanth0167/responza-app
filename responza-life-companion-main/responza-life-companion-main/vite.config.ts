@@ -8,6 +8,7 @@ export default defineConfig(({ mode }) => ({
   server: {
     host: "::",
     port: 8080,
+    allowedHosts: ["responza-app.onrender.com"],   // <-- idi add cheyyi
     hmr: {
       overlay: false,
     },
