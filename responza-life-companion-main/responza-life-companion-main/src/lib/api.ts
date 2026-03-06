@@ -1,4 +1,4 @@
-const API_BASE = "https://responza-api.onrender.com";
+export const API_BASE = "https://responza-api.onrender.com";
 
 export const sendOTP = async (mobile_number: string) => {
   const response = await fetch(`${API_BASE}/otp/send-otp`, {
