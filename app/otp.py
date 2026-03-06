@@ -32,7 +32,7 @@ else:
 # =========================
 class SendOTPRequest(BaseModel):
     mobile_number: str
-    purpose: str = "registration"  # "registration" | "login"
+    purpose: str = "registration"  # registration | login
 
 
 class VerifyOTPRequest(BaseModel):
@@ -48,7 +48,7 @@ def generate_otp():
 
 
 # =========================
-# Reusable SMS Function (🔥 Fix for your error)
+# Reusable SMS Function
 # =========================
 def send_sms(mobile_number: str, message: str):
     if not twilio_client:
@@ -63,12 +63,14 @@ def send_sms(mobile_number: str, message: str):
         )
         logging.info(f"SMS sent to {mobile_number}")
         return True
+
     except Exception as e:
         logging.error(f"Failed to send SMS: {e}")
         return False
 
 
 def send_sms_with_error(mobile_number: str, message: str):
+
     if not twilio_client:
         return False, "Twilio client not configured. Check TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN."
 
@@ -79,9 +81,10 @@ def send_sms_with_error(mobile_number: str, message: str):
             to=mobile_number
         )
         return True, None
+
     except TwilioRestException as e:
-        # Include Twilio error code for faster troubleshooting.
         return False, f"Twilio error {e.code}: {e.msg}"
+
     except Exception as e:
         return False, f"SMS send failed: {str(e)}"
 
@@ -91,9 +94,11 @@ def send_sms_with_error(mobile_number: str, message: str):
 # =========================
 @router.post("/send-otp")
 async def send_otp(data: SendOTPRequest):
-    purpose = (data.purpose or "registration").strip().lower()
 
-    user = users_collection.find_one({"mobile_number": data.mobile_number})
+    purpose = (data.purpose or "registration").strip().lower()
+    mobile = data.mobile_number.strip()
+
+    user = users_collection.find_one({"mobile_number": mobile})
 
     if purpose == "login" and not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -103,19 +108,26 @@ async def send_otp(data: SendOTPRequest):
 
     otp_code = generate_otp()
 
-    # Delete old OTPs
-    otp_collection.delete_many({"mobile_number": data.mobile_number})
+    # Delete old OTP
+    otp_collection.delete_many({"mobile_number": mobile})
 
     otp_collection.insert_one({
-        "mobile_number": data.mobile_number,
+        "mobile_number": mobile,
         "otp_code": otp_code,
         "expires_at": datetime.utcnow() + timedelta(minutes=5),
         "created_at": datetime.utcnow()
     })
 
-    sent, error_detail = send_sms_with_error(data.mobile_number, f"Your OTP code is: {otp_code}")
+    sent, error_detail = send_sms_with_error(
+        mobile,
+        f"Your OTP code is: {otp_code}"
+    )
+
     if not sent:
-        raise HTTPException(status_code=500, detail=error_detail or "Failed to send OTP")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail or "Failed to send OTP"
+        )
 
     return {"message": "OTP sent successfully"}
 
@@ -126,25 +138,28 @@ async def send_otp(data: SendOTPRequest):
 @router.post("/verify-otp")
 async def verify_otp(data: VerifyOTPRequest):
 
+    mobile = data.mobile_number.strip()
+    otp_code = data.otp_code.strip()
+
     otp_record = otp_collection.find_one({
-        "mobile_number": data.mobile_number,
-        "otp_code": data.otp_code
+        "mobile_number": mobile,
+        "otp_code": otp_code
     })
 
     if not otp_record:
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
     if datetime.utcnow() > otp_record["expires_at"]:
-        otp_collection.delete_many({"mobile_number": data.mobile_number})
+        otp_collection.delete_many({"mobile_number": mobile})
         raise HTTPException(status_code=400, detail="OTP expired")
 
     # Mark user as verified
     users_collection.update_one(
-        {"mobile_number": data.mobile_number},
+        {"mobile_number": mobile},
         {"$set": {"mobile_verified": True}}
     )
 
     # Delete OTP after success
-    otp_collection.delete_many({"mobile_number": data.mobile_number})
+    otp_collection.delete_many({"mobile_number": mobile})
 
     return {"message": "Mobile verified successfully"}

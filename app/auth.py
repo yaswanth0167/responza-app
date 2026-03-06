@@ -1,12 +1,12 @@
 import os
 import re
 import uuid
+import bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr, Field
 
@@ -15,6 +15,7 @@ from app.db import users_collection, security_collection, DB_NAME
 # ==============================
 # LOAD ENV VARIABLES
 # ==============================
+
 load_dotenv()
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "supersecretkey")
@@ -22,38 +23,41 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # ==============================
-# PASSWORD HASHING
+# HELPER FUNCTIONS
 # ==============================
-# using bcrypt library directly to avoid passlib wrap-bug detection issues
-import bcrypt
-
 
 def normalize_email(email: str) -> str:
     return str(email).strip().lower()
 
-
 def email_query(email: str) -> dict:
     return {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
-
 
 def username_query(username: str) -> dict:
     return {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}}
 
+# ==============================
+# PASSWORD HASHING
+# ==============================
+
 def hash_password(password: str):
-    # bcrypt limits to 72 bytes; ensure string is encoded to utf-8
-    hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-    return hashed.decode('utf-8')
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    return hashed.decode("utf-8")
 
 def verify_password(plain_password: str, hashed_password: str):
     try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8")
+        )
     except Exception:
         return False
 
 # ==============================
-# JWT TOKEN FUNCTIONS
+# JWT TOKEN
 # ==============================
+
 def create_access_token(data: dict, expires_delta: timedelta = None):
+
     to_encode = data.copy()
 
     expire = datetime.utcnow() + (
@@ -61,14 +65,18 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     )
 
     to_encode.update({"exp": expire})
+
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def verify_token(token: str):
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
+
     except JWTError:
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token"
@@ -79,6 +87,7 @@ def verify_token(token: str):
 # ==============================
 
 class RegisterUser(BaseModel):
+
     first_name: str
     last_name: str
     dob: str = ""
@@ -96,32 +105,38 @@ class RegisterUser(BaseModel):
 
 
 class LoginUser(BaseModel):
+
     email: str
     password: str
 
 
 # ==============================
-# AUTH ROUTER
+# ROUTER
 # ==============================
+
 auth_router = APIRouter()
 security = HTTPBearer()
 
 # ==============================
 # REGISTER USER
 # ==============================
+
 @auth_router.post("/register")
 async def register(user: RegisterUser):
+
     normalized_email = normalize_email(user.email)
     username = user.username.strip()
+
     if not username:
         base = normalized_email.split("@")[0]
         username = f"{base}_{uuid.uuid4().hex[:6]}"
+
     mobile_number = user.mobile_number.strip()
 
     if users_collection.find_one(email_query(normalized_email)):
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    if users_collection.find_one({"username": username}):
+    if users_collection.find_one(username_query(username)):
         username = f"{username}_{uuid.uuid4().hex[:4]}"
 
     if mobile_number and users_collection.find_one({"mobile_number": mobile_number}):
@@ -150,8 +165,9 @@ async def register(user: RegisterUser):
     }
 
     result = users_collection.insert_one(user_data)
+
     if not result.acknowledged:
-        raise HTTPException(status_code=500, detail="User registration write not acknowledged")
+        raise HTTPException(status_code=500, detail="User registration failed")
 
     return {
         "message": "User registered successfully",
@@ -159,37 +175,43 @@ async def register(user: RegisterUser):
         "database": DB_NAME
     }
 
-
 # ==============================
 # LOGIN USER
 # ==============================
+
 @auth_router.post("/login")
 async def login(user: LoginUser):
+
     identifier = str(user.email).strip()
+
     if not identifier:
-        raise HTTPException(status_code=400, detail="Email or username is required")
+        raise HTTPException(status_code=400, detail="Email or username required")
 
     db_user = None
 
-    # If identifier looks like an email, search by email first.
     if "@" in identifier:
         normalized_email = normalize_email(identifier)
         db_user = users_collection.find_one(email_query(normalized_email))
+
     else:
-        # Support login with username (case-insensitive).
         db_user = users_collection.find_one(username_query(identifier))
-        # Fallback: in case user entered email without @ by mistake, try normalized query too.
+
         if not db_user:
-            db_user = users_collection.find_one(email_query(normalize_email(identifier)))
+            db_user = users_collection.find_one(
+                email_query(normalize_email(identifier))
+            )
 
     stored_password = db_user.get("password") if db_user else None
 
-    # Backward compatibility for accounts created with "password_hash".
-    if not stored_password and db_user:
+    if db_user and not stored_password:
         stored_password = db_user.get("password_hash")
 
     if not db_user or not stored_password or not verify_password(user.password, stored_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
 
     subject_email = normalize_email(db_user["email"])
 
@@ -205,17 +227,19 @@ async def login(user: LoginUser):
         "token_type": "bearer"
     }
 
+# ==============================
+# ADMIN CHECK
+# ==============================
 
-# ==============================
-# ADMIN CHECK DEPENDENCY
-# ==============================
 def admin_required(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
+
     token = credentials.credentials
     payload = verify_token(token)
 
     if payload.get("role") != "admin":
+
         raise HTTPException(
             status_code=403,
             detail="Admin access required"
@@ -228,34 +252,36 @@ def admin_required(
 async def admin_route(user=Depends(admin_required)):
     return {"message": "Welcome Admin 🔥"}
 
+# ==============================
+# CURRENT USER
+# ==============================
 
-# ==============================
-# GET CURRENT USER (IMPORTANT FIX)
-# ==============================
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
+
     token = credentials.credentials
     payload = verify_token(token)
 
-    db_user = users_collection.find_one(email_query(payload["sub"]))
+    db_user = users_collection.find_one(
+        email_query(payload["sub"])
+    )
 
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 🔥 RETURN FULL USER INCLUDING _id
     db_user["_id"] = str(db_user["_id"])
     return db_user
 
+# ==============================
+# PROFILE
+# ==============================
 
-# ==============================
-# GET PROFILE
-# ==============================
 @auth_router.get("/me")
 async def get_profile(current_user: dict = Depends(get_current_user)):
 
     return {
-        "user_id": str(current_user["_id"]),
+        "user_id": current_user["_id"],
         "email": current_user["email"],
         "username": current_user["username"],
         "first_name": current_user["first_name"],
@@ -271,10 +297,10 @@ async def get_profile(current_user: dict = Depends(get_current_user)):
         "nominee": current_user.get("nominee", {})
     }
 
-
 # ==============================
 # FORGOT PASSWORD
 # ==============================
+
 @auth_router.post("/forgot-password")
 async def forgot_password(
     email: str,
@@ -282,9 +308,13 @@ async def forgot_password(
     favorite_place: str,
     father_name: str
 ):
+
     normalized_email = normalize_email(email)
 
-    user = users_collection.find_one(email_query(normalized_email))
+    user = users_collection.find_one(
+        email_query(normalized_email)
+    )
+
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -298,14 +328,15 @@ async def forgot_password(
     if not security_data:
         raise HTTPException(status_code=400, detail="Security answers incorrect")
 
-    return {"message": "Security verified. You can reset password now."}
-
+    return {"message": "Security verified. You can reset password"}
 
 # ==============================
 # RESET PASSWORD
 # ==============================
+
 @auth_router.post("/reset-password")
 async def reset_password(email: str, new_password: str):
+
     normalized_email = normalize_email(email)
 
     hashed = hash_password(new_password)
