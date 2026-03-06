@@ -1,7 +1,7 @@
 const API_BASE = "https://responza-api.onrender.com";
 
 export const sendOTP = async (mobile_number: string) => {
-  const response = await fetch(`${API_BASE}/send-otp`, {
+  const response = await fetch(`${API_BASE}/otp/send-otp`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -12,11 +12,15 @@ export const sendOTP = async (mobile_number: string) => {
     }),
   });
 
+  if (!response.ok) {
+    throw new Error("Failed to send OTP");
+  }
+
   return response.json();
 };
 
 export const verifyOTP = async (mobile_number: string, otp_code: string) => {
-  const response = await fetch(`${API_BASE}/verify-otp`, {
+  const response = await fetch(`${API_BASE}/otp/verify-otp`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -26,6 +30,10 @@ export const verifyOTP = async (mobile_number: string, otp_code: string) => {
       otp_code,
     }),
   });
+
+  if (!response.ok) {
+    throw new Error("OTP verification failed");
+  }
 
   return response.json();
 };
@@ -41,6 +49,10 @@ export const loginUser = async (email: string, password: string) => {
       password,
     }),
   });
+
+  if (!response.ok) {
+    throw new Error("Login failed");
+  }
 
   return response.json();
 };
